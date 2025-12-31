@@ -1,0 +1,243 @@
+// ==========================================
+//  CÓDIGO FINAL - HAMSTERZINHO 2.0
+// ==========================================
+
+#define BLYNK_TEMPLATE_ID "TMPL2_QkfK9Jx"
+#define BLYNK_TEMPLATE_NAME "Quickstart Device"
+#define BLYNK_AUTH_TOKEN "QkCg8xppu0GjoFnc-ISNbCdrti-xbvJR"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <HX711.h>
+#include <ESP32Servo.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+
+// -------- HARDWARE --------
+#define DT 4
+#define SCK 5
+#define SERVO_PIN 18
+#define IR_PIN 19
+
+#define RELAY_BOMBA 25
+#define RELAY_VALVULA 26
+#define SENSOR_AGUA 33
+
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+// -------- RED --------
+char ssid[] = "ESTUDIANTES";
+char pass[] = "";
+
+const char* mqtt_server = "192.168.212.154";
+const int mqtt_port = 1883;
+const char* mqtt_topic_sub = "hugo/dispensador/comando";
+
+// -------- OBJETOS --------
+HX711 scale;
+Servo servoMotor;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// -------- BALANZA --------
+float factor_calibracion = 1199.4;
+float offset = 0;
+float pesoNeto = 0;
+
+// -------- COMIDA --------
+float metaPeso = 0;
+bool dispensandoActivo = false;
+unsigned long ultimaDispensacion = 0;
+const long cooldownComida = 10000;
+String especieActual = "N/A";
+
+// -------- AGUA --------
+bool modoManual = false;
+unsigned long inicioBomba = 0;
+bool bloqueoBomba = false;
+const long tiempoMaxBomba = 10000;
+
+int aguaSeco = 0;
+int UMBRAL_AGUA = 0;
+
+// -------- TIMERS --------
+unsigned long lastUpdate = 0;
+unsigned long lastSerial = 0;
+
+// -------- HISTORIAL --------
+void registrarDispensacion(float peso, String modo, String especie) {
+  Serial.println("📊 HISTORIAL");
+  Serial.print("🐹 Especie: "); Serial.println(especie);
+  Serial.print("Modo: "); Serial.println(modo);
+  Serial.print("Peso: "); Serial.print(peso, 2); Serial.println(" g");
+  Serial.println("-------------------");
+}
+
+// -------- FUNCIONES --------
+float calcularOffset() {
+  return scale.get_units(50);
+}
+
+void pulsoMotor() {
+  servoMotor.write(135);
+  delay(300);
+  servoMotor.write(90);
+  delay(600);
+}
+
+// -------- MQTT --------
+void callback(char* topic, byte* payload, unsigned int length) {
+  char cmd = (char)payload[0];
+
+  if (millis() - ultimaDispensacion < cooldownComida) return;
+
+  if (cmd == '1') { metaPeso = 5;  especieActual = "Ruso"; }
+  if (cmd == '2') { metaPeso = 8;  especieActual = "Sirio"; }
+  if (cmd == '0') { metaPeso = 10; especieActual = "Cuy"; }
+
+  dispensandoActivo = true;
+  ultimaDispensacion = millis();
+
+  Serial.print("🐹 MQTT -> ");
+  Serial.print(especieActual);
+  Serial.print(" | Meta ");
+  Serial.println(metaPeso);
+}
+
+void reconnect() {
+  if (!client.connected()) {
+    client.connect("ESP32_HUGO");
+    client.subscribe(mqtt_topic_sub);
+  }
+}
+
+// -------- BLYNK --------
+BLYNK_WRITE(V11) {
+  modoManual = param.asInt();
+
+  if (modoManual) {
+    digitalWrite(RELAY_BOMBA, RELAY_ON);
+    digitalWrite(RELAY_VALVULA, RELAY_ON);
+    Serial.println("⚠️ MODO MANUAL ON");
+  } else {
+    digitalWrite(RELAY_BOMBA, RELAY_OFF);
+    digitalWrite(RELAY_VALVULA, RELAY_OFF);
+    bloqueoBomba = false;
+    inicioBomba = 0;
+    Serial.println("✅ MODO AUTO");
+  }
+}
+
+// -------- SETUP --------
+void setup() {
+  Serial.begin(9600);
+  Serial.println("\n=== HUGO 3000 PRO ===");
+
+  pinMode(RELAY_BOMBA, OUTPUT);
+  pinMode(RELAY_VALVULA, OUTPUT);
+  digitalWrite(RELAY_BOMBA, RELAY_OFF);
+  digitalWrite(RELAY_VALVULA, RELAY_OFF);
+
+  pinMode(SENSOR_AGUA, INPUT);
+
+  servoMotor.attach(SERVO_PIN, 500, 2500);
+  servoMotor.write(90);
+
+  scale.begin(DT, SCK);
+  scale.set_scale(factor_calibracion);
+  offset = calcularOffset();
+
+  delay(2000);
+  long suma = 0;
+  for (int i = 0; i < 20; i++) {
+    suma += analogRead(SENSOR_AGUA);
+    delay(50);
+  }
+
+  aguaSeco = suma / 20;
+  UMBRAL_AGUA = aguaSeco + 300;  // 🔥 CLAVE
+
+  Serial.print("💧 Agua seco: ");
+  Serial.print(aguaSeco);
+  Serial.print(" | Umbral mojado: ");
+  Serial.println(UMBRAL_AGUA);
+
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+}
+
+// -------- LOOP --------
+void loop() {
+  Blynk.run();
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  unsigned long now = millis();
+
+  // ===== AGUA =====
+  if (!modoManual) {
+    int nivel = analogRead(SENSOR_AGUA);
+    bool mojado = (nivel > UMBRAL_AGUA);
+
+    Serial.print("💧 Sensor Agua: ");
+    Serial.print(nivel);
+    Serial.print(" -> ");
+    Serial.println(mojado ? "MOJADO" : "SECO");
+
+    if (mojado) {
+      digitalWrite(RELAY_BOMBA, RELAY_OFF);
+      inicioBomba = 0;
+      bloqueoBomba = false;
+      Serial.println("🛑 Bomba OFF (hay agua)");
+    } else if (!bloqueoBomba) {
+      digitalWrite(RELAY_BOMBA, RELAY_ON);
+      Serial.println("🚰 Bomba ON (rellenando)");
+
+      if (inicioBomba == 0) inicioBomba = now;
+
+      if (now - inicioBomba > tiempoMaxBomba) {
+        digitalWrite(RELAY_BOMBA, RELAY_OFF);
+        bloqueoBomba = true;
+        Serial.println("🚨 TANQUE VACÍO");
+      }
+    }
+  }
+
+  // ===== COMIDA =====
+  if (now - lastUpdate > 300) {
+    lastUpdate = now;
+
+    float raw = scale.get_units(5);
+    pesoNeto = abs(raw - offset);
+    if (pesoNeto < 0.5) pesoNeto = 0;
+
+    if (dispensandoActivo) {
+      if (pesoNeto < metaPeso) {
+        Serial.println("⚙️ Dispensando...");
+        pulsoMotor();
+      } else {
+        dispensandoActivo = false;
+        Serial.println("✅ META ALCANZADA");
+        registrarDispensacion(pesoNeto, "automatico", especieActual);
+      }
+    }
+  }
+}
+BLYNK_WRITE(V1) {   // Botón Blynk comida
+  if (param.asInt()) {
+    metaPeso = 5.0;
+    especieActual = "Blynk_Manual";
+    dispensandoActivo = true;
+    ultimaDispensacion = millis();
+
+    Serial.println("📱 BLYNK -> Dispensar 5g");
+    Blynk.virtualWrite(V1, 0); // auto-off
+  }
+}
